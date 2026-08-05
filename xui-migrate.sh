@@ -295,8 +295,10 @@ tar czf /tmp/xui-migration.tar.gz \
     /etc/systemd/system/xui-bot.service \
     /root/.acme.sh/ 2>/dev/null
 
-# перезапустить старый (пусть работает как fallback пока)
-systemctl start x-ui xui-bot 2>/dev/null || true
+# x-ui поднимаем обратно как fallback proxy на 3-5 дней
+# xui-bot НЕ поднимаем — новый бот будет отвечать один
+systemctl start x-ui 2>/dev/null || true
+systemctl disable xui-bot 2>/dev/null || true
 
 ls -la /tmp/xui-migration.tar.gz
 REMOTE_EOF
