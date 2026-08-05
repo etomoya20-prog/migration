@@ -2,27 +2,33 @@
 #
 # xui-migrate.sh — миграция 3x-UI + xui-bot со старого VPS на новый.
 #
-# Запуск: НА НОВОМ (чистом) VPS от root.
-# Скрипт тянет данные со старого VPS по scp, разворачивает всё локально,
-# пересоздаёт Python venv для бота, опционально обновляет DNS в Cloudflare,
-# стартует службы и делает финальные проверки.
+# Запуск: НА НОВОМ (чистом) VPS от root, без аргументов.
+# Скрипт по очереди спросит все нужные параметры, проверит CF токен,
+# сам настроит SSH-ключ на старый VPS (если нужно), покажет сводку
+# и попросит подтверждение перед стартом.
 #
-# Параметры (через env или флаги):
-#   OLD_VPS_HOST   IP или hostname старого VPS (обязательно)
-#   OLD_VPS_USER   ssh user (default: root)
-#   OLD_VPS_PORT   ssh port (default: 22)
-#   DOMAIN         основной домен, например bezfigni.xyz (обязательно)
-#   CF_API_TOKEN   Cloudflare API токен с Zone.DNS Edit — если задан,
-#                  скрипт сам обновит A-записи. Иначе — напомнит сделать вручную.
-#   SKIP_WARP      если "1" — не устанавливать CF Warp (SOCKS5 для RU-трафика).
-#                  По умолчанию скрипт устанавливает wgcf + wireproxy на 127.0.0.1:40000.
+# Что делает:
+#   1. Тянет данные со старого VPS по scp
+#   2. Разворачивает всё локально (x-ui, xui-bot, cert, acme.sh)
+#   3. Пересоздаёт Python venv для бота (может быть другая версия Python)
+#   4. Устанавливает CF Warp (wgcf + wireproxy на 127.0.0.1:40000)
+#   5. Обновляет A-записи в Cloudflare через API
+#   6. Запускает службы, финальные проверки
 #
-# Пример:
-#   OLD_VPS_HOST=2.27.30.95 DOMAIN=bezfigni.xyz \
-#   CF_API_TOKEN=xxxxx bash xui-migrate.sh
+# Все параметры можно передать и через env/флаги (для автоматизации):
+#   OLD_VPS_HOST / --old       IP или hostname старого VPS
+#   OLD_VPS_USER / --user      ssh user (default: root)
+#   OLD_VPS_PORT / --port      ssh port (default: 22)
+#   DOMAIN       / --domain    домен, например bezfigni.xyz
+#   CF_API_TOKEN / --cf-token  Cloudflare API token с Zone.DNS Edit
+#   SKIP_WARP    / --skip-warp пропустить установку CF Warp
 #
-# Или:
-#   bash xui-migrate.sh --old 2.27.30.95 --domain bezfigni.xyz --cf-token xxx
+# Что не задано — скрипт спросит интерактивно.
+#
+# Примеры:
+#   bash xui-migrate.sh                                    # полностью интерактивно
+#   bash xui-migrate.sh --old 2.27.30.95 --domain X.xyz    # спросит только CF token
+#   OLD_VPS_HOST=1.2.3.4 DOMAIN=X.xyz CF_API_TOKEN=t bash xui-migrate.sh
 
 set -euo pipefail
 
@@ -63,19 +69,137 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$OLD_VPS_HOST" ]] && die "OLD_VPS_HOST не задан (env или --old)"
-[[ -z "$DOMAIN"       ]] && die "DOMAIN не задан (env или --domain)"
-[[ $EUID -ne 0        ]] && die "запускать от root"
+[[ $EUID -ne 0 ]] && die "запускать от root"
 
+# ---------- интерактивный опрос ----------
+# всё что не задано флагом/env — спрашиваем у пользователя
+# TTY нужен для интерактива; при запуске из пайпа падаем на fail
+prompt() {
+    # $1 = prompt text, $2 = default value (можно пустой), $3 = "silent" для скрытого ввода
+    local msg="$1" default="${2:-}" silent="${3:-}"
+    local value=""
+    while [[ -z "$value" ]]; do
+        if [[ -n "$default" ]]; then
+            printf "  %s [%s]: " "$msg" "$default" >&2
+        else
+            printf "  %s: " "$msg" >&2
+        fi
+        if [[ "$silent" == "silent" ]]; then
+            read -rs value
+            echo >&2
+        else
+            read -re value
+        fi
+        [[ -z "$value" && -n "$default" ]] && value="$default"
+    done
+    printf '%s' "$value"
+}
+
+echo -e "${C_BOLD}=== xui migration ===${C_RESET}"
+echo "Скрипт мигрирует 3x-UI + xui-bot со старого VPS сюда."
+echo "Он остановит службы на старом VPS ~30 секунд для сбора архива."
+echo
+
+# старый VPS
+if [[ -z "$OLD_VPS_HOST" ]]; then
+    echo -e "${C_BOLD}Старый VPS:${C_RESET}"
+    OLD_VPS_HOST=$(prompt "IP или hostname")
+    OLD_VPS_USER=$(prompt "ssh user" "root")
+    OLD_VPS_PORT=$(prompt "ssh port" "22")
+    echo
+fi
+
+# домен
+if [[ -z "$DOMAIN" ]]; then
+    echo -e "${C_BOLD}Домен:${C_RESET}"
+    DOMAIN=$(prompt "домен (без https://)")
+    # снять протокол если пользователь всё-таки его вписал
+    DOMAIN="${DOMAIN#https://}"
+    DOMAIN="${DOMAIN#http://}"
+    DOMAIN="${DOMAIN%/}"
+    echo
+fi
+
+# CF token
+if [[ -z "$CF_API_TOKEN" ]]; then
+    echo -e "${C_BOLD}Cloudflare API token:${C_RESET}"
+    echo "  (для авто-обновления DNS; Enter пропустит — обновишь вручную)"
+    printf "  токен (ввод скрыт): " >&2
+    read -rs CF_API_TOKEN
+    echo >&2
+    echo
+fi
+
+# валидация CF токена (если задан)
+if [[ -n "$CF_API_TOKEN" ]]; then
+    echo -en "  проверяю CF токен... "
+    CF_CHECK=$(curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+        "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null || echo '{}')
+    CF_STATUS=$(echo "$CF_CHECK" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get('result', {}).get('status', 'invalid'))
+except Exception:
+    print('invalid')
+" 2>/dev/null || echo "invalid")
+
+    if [[ "$CF_STATUS" != "active" ]]; then
+        echo -e "${C_RED}не работает${C_RESET}"
+        CF_ERR=$(echo "$CF_CHECK" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print((d.get('errors') or [{'message':'нет ответа от CF API'}])[0].get('message'))
+except Exception:
+    print('нет ответа от CF API')
+" 2>/dev/null)
+        die "CF token невалиден: $CF_ERR"
+    fi
+
+    # проверка что токен видит зону
+    ZONE_CHECK=$(curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+        "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" 2>/dev/null)
+    ZONE_ID_PRECHECK=$(echo "$ZONE_CHECK" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    r = d.get('result') or []
+    print(r[0].get('id') if r else '')
+except Exception:
+    pass
+" 2>/dev/null)
+
+    if [[ -z "$ZONE_ID_PRECHECK" ]]; then
+        echo -e "${C_RED}зона недоступна${C_RESET}"
+        die "токен активен, но не видит зону $DOMAIN. Проверь права токена (Zone.DNS Edit для $DOMAIN)"
+    fi
+    echo -e "${C_GRN}ok, доступ к $DOMAIN есть${C_RESET}"
+    echo
+fi
+
+# CF Warp: устанавливать?
+if [[ -z "$SKIP_WARP" ]]; then
+    printf "  Устанавливать Cloudflare Warp (для RU-трафика)? [Y/n]: " >&2
+    read -re WARP_ANS
+    [[ "$WARP_ANS" =~ ^[Nn] ]] && SKIP_WARP=1
+    echo
+fi
+
+# сводка + подтверждение
 readonly BACKUP_PATH="/tmp/xui-migration.tar.gz"
 readonly NEW_IP=$(curl -s4 --max-time 5 https://api.ipify.org || die "не смог узнать свой IP")
 
-echo -e "${C_BOLD}=== xui migration ===${C_RESET}"
+echo -e "${C_BOLD}Итого:${C_RESET}"
 echo "  old VPS:  $OLD_VPS_USER@$OLD_VPS_HOST:$OLD_VPS_PORT"
 echo "  new VPS:  $NEW_IP (this)"
 echo "  domain:   $DOMAIN"
-echo "  CF DNS:   $([[ -n "$CF_API_TOKEN" ]] && echo 'auto' || echo 'manual (no token)')"
+echo "  CF DNS:   $([[ -n "$CF_API_TOKEN" ]] && echo 'auto (обновится)' || echo 'manual (обновишь сам)')"
 echo "  CF Warp:  $([[ -n "$SKIP_WARP" ]] && echo 'skip' || echo 'install')"
+echo
+printf "  Продолжить? [y/N]: " >&2
+read -re CONFIRM
+[[ "$CONFIRM" =~ ^[Yy] ]] || die "отменено пользователем"
 echo
 
 # ---------- 0. проверки окружения ----------
@@ -87,7 +211,7 @@ step "0. проверка окружения"
     || warn "дистрибутив $ID не тестировался (ожидалось ubuntu/debian) — продолжаем"
 
 # ssh reachability
-if ! timeout 5 bash -c "cat < /dev/tcp/$OLD_VPS_HOST/$OLD_VPS_PORT" 2>/dev/null; then
+if ! timeout 3 bash -c "exec 3<>/dev/tcp/$OLD_VPS_HOST/$OLD_VPS_PORT" 2>/dev/null; then
     die "не могу дотянуться до $OLD_VPS_HOST:$OLD_VPS_PORT — проверь адрес и firewall"
 fi
 ok "ssh порт $OLD_VPS_PORT на старом VPS открыт"
@@ -98,9 +222,49 @@ SSH_OPTS=(-p "$OLD_VPS_PORT" -o StrictHostKeyChecking=accept-new
 if ssh "${SSH_OPTS[@]}" "$OLD_VPS_USER@$OLD_VPS_HOST" true 2>/dev/null; then
     ok "ssh key auth работает"
 else
-    warn "ключ не настроен — scp будет спрашивать пароль"
-    SSH_OPTS=(-p "$OLD_VPS_PORT" -o StrictHostKeyChecking=accept-new
-              -o ConnectTimeout=10)
+    warn "ssh key auth не работает — настраиваю"
+
+    # 1. локальный ключ есть?
+    if [[ ! -f /root/.ssh/id_ed25519 && ! -f /root/.ssh/id_rsa ]]; then
+        ok "генерирую /root/.ssh/id_ed25519"
+        mkdir -p /root/.ssh
+        chmod 700 /root/.ssh
+        ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519 -q
+    fi
+
+    # 2. установить sshpass если нет ssh-copy-id + запросить пароль
+    command -v ssh-copy-id >/dev/null 2>&1 || apt-get install -y -qq openssh-client
+    apt-get install -y -qq sshpass 2>/dev/null || true
+
+    echo
+    echo -e "  ${C_YEL}Введи пароль пользователя ${OLD_VPS_USER}@${OLD_VPS_HOST}${C_RESET}"
+    echo -e "  ${C_YEL}(один раз для копирования ключа, дальше без пароля):${C_RESET}"
+    printf "  пароль: " >&2
+    read -rs OLD_VPS_PASS
+    echo >&2
+
+    # 3. копируем ключ через sshpass (обходит "password: " интерактив)
+    if command -v sshpass >/dev/null 2>&1; then
+        sshpass -p "$OLD_VPS_PASS" ssh-copy-id \
+            -o StrictHostKeyChecking=accept-new \
+            -p "$OLD_VPS_PORT" \
+            "$OLD_VPS_USER@$OLD_VPS_HOST" >/dev/null 2>&1 \
+            || die "ssh-copy-id упал — проверь пароль и попробуй заново"
+    else
+        # fallback без sshpass — интерактивно
+        ssh-copy-id -o StrictHostKeyChecking=accept-new \
+            -p "$OLD_VPS_PORT" \
+            "$OLD_VPS_USER@$OLD_VPS_HOST" \
+            || die "ssh-copy-id упал"
+    fi
+
+    # 4. проверка что теперь пускает
+    if ssh "${SSH_OPTS[@]}" "$OLD_VPS_USER@$OLD_VPS_HOST" true 2>/dev/null; then
+        ok "ssh key auth настроен"
+    else
+        die "ключ скопирован, но всё равно не пускает — проверь sshd_config на старом VPS"
+    fi
+    unset OLD_VPS_PASS
 fi
 
 # ---------- 1. пакеты ----------
@@ -141,7 +305,9 @@ ok "архив собран на старом VPS"
 # ---------- 3. качаем архив ----------
 step "3. копирование архива"
 
-scp "${SSH_OPTS[@]}" \
+# scp использует -P для порта (не -p как ssh)
+scp -P "$OLD_VPS_PORT" -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=10 -o BatchMode=yes \
     "$OLD_VPS_USER@$OLD_VPS_HOST:/tmp/xui-migration.tar.gz" \
     "$BACKUP_PATH"
 
@@ -402,18 +568,31 @@ done
 
 # берём subId первого клиента и проверяем что URL содержит домен
 SUB_ID=$(sqlite3 /etc/x-ui/x-ui.db \
-    "SELECT json_extract(value, '\$.subId') FROM (SELECT json_each.value FROM inbounds, json_each(json_extract(inbounds.settings, '\$.clients')) WHERE inbounds.id=1) LIMIT 1;" \
-    2>/dev/null)
+    "SELECT settings FROM inbounds WHERE id=1;" 2>/dev/null \
+    | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    clients = d.get('clients', [])
+    if clients:
+        print(clients[0].get('subId', ''))
+except Exception:
+    pass
+" 2>/dev/null)
 
 if [[ -n "$SUB_ID" ]]; then
     SUB_PATH=$(sqlite3 /etc/x-ui/x-ui.db \
         "SELECT value FROM settings WHERE key='subPath';" 2>/dev/null | sed 's|/$||')
     SUB_PORT=$(sqlite3 /etc/x-ui/x-ui.db \
         "SELECT value FROM settings WHERE key='subPort';" 2>/dev/null)
+    # subDomain из БД (может отличаться от --domain если серт ещё не обновлён)
+    SUB_DOMAIN=$(sqlite3 /etc/x-ui/x-ui.db \
+        "SELECT value FROM settings WHERE key='subDomain';" 2>/dev/null)
+    [[ -z "$SUB_DOMAIN" ]] && SUB_DOMAIN="$DOMAIN"
 
     VLESS_URL=$(curl -sk --max-time 5 \
         "https://127.0.0.1:${SUB_PORT}${SUB_PATH}/${SUB_ID}" \
-        -H "Host: $DOMAIN" | base64 -d 2>/dev/null | head -1)
+        -H "Host: $SUB_DOMAIN" | base64 -d 2>/dev/null | head -1)
 
     if [[ "$VLESS_URL" == *"@${DOMAIN}:"* ]]; then
         ok "VLESS URL корректный: @${DOMAIN}:..."
