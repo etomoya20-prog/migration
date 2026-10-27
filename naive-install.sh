@@ -18,7 +18,9 @@
 #   5. ждёт сертификат и проверяет туннель с этой же машины
 #
 # Повторный запуск безопасен: если конфиг не изменился, служба не
-# перезапускается. Логин и пароль по умолчанию — из прежнего Caddyfile.
+# перезапускается. Логин и пароль по умолчанию — из прежнего Caddyfile; на
+# чистой машине скрипт их спросит: при переезде вписать ПРЕЖНИЕ, иначе все
+# клиенты после смены DNS перестанут подключаться.
 #
 # Параметры флагами или через env (что не задано — спросит):
 #   DOMAIN       / --domain      домен, A-запись которого смотрит (или будет) сюда
@@ -163,13 +165,28 @@ while :; do
     [[ -n "$YES" ]] && die "порт $NAIVE_PORT занят"
     NAIVE_PORT=""
 done
+CREDS="заданы флагами"
 if [[ -z "$NAIVE_USER" || -z "$NAIVE_PASS" ]]; then
     if [[ -n "$OLD_USER" ]] && confirm "оставить прежние логин и пароль?" y; then
-        NAIVE_USER="$OLD_USER"; NAIVE_PASS="$OLD_PASS"
+        NAIVE_USER="$OLD_USER"; NAIVE_PASS="$OLD_PASS"; CREDS="прежние"
+    elif [[ -z "$OLD_USER" && -z "$YES" ]]; then
+        # Чистая машина. Если это переезд, клиенты знают СТАРЫЕ логин и пароль:
+        # новые случайные молча отрезали бы всех после смены DNS (26.10.2026).
+        echo "  Переезд со старого сервера? Впиши прежние логин и пароль, иначе все"
+        echo "  клиенты перестанут подключаться. Где взять: на старом сервере"
+        echo "  grep basic_auth /etc/caddy/Caddyfile, дома ~/.naive.env."
+        echo "  Новый сервер с нуля — просто Enter, будут случайные."
+        printf "  логин [случайный]: " >&2; read -re NAIVE_USER
+        printf "  пароль [случайный] (ввод скрыт): " >&2; read -rs NAIVE_PASS; echo >&2
+        if [[ -n "$NAIVE_USER" && -n "$NAIVE_PASS" ]]; then
+            CREDS="введённые"
+        else
+            NAIVE_USER=$(rand 11); NAIVE_PASS=$(rand 24); CREDS="НОВЫЕ"
+        fi
     else
-        NAIVE_USER=$(rand 11); NAIVE_PASS=$(rand 24)
-        ok "сгенерированы новые логин и пароль"
+        NAIVE_USER=$(rand 11); NAIVE_PASS=$(rand 24); CREDS="НОВЫЕ"
     fi
+    [[ "$CREDS" == НОВЫЕ ]] && warn "сгенерированы новые логин и пароль: всем клиентам их придётся сменить"
 fi
 [[ "$NAIVE_USER$NAIVE_PASS" =~ ^[A-Za-z0-9]+$ ]] || die "логин и пароль — только буквы и цифры"
 
@@ -187,6 +204,7 @@ ALPN=1
 
 step "Сводка"
 echo "  $DOMAIN:$NAIVE_PORT на $MY_IP, Caddy $CADDY_VERSION + forwardproxy, заглушка-сайт"
+echo "  логин и пароль: $CREDS"
 echo "  сертификат: $([[ -n $ALPN ]] && echo 'tls-alpn или HTTP-01' || echo "только HTTP-01 на :80 (443 занят «$OWN443»)")"
 if [[ "$CUR_DNS" == "$MY_IP" ]]; then echo "  DNS: уже $MY_IP"
 elif [[ -n "$CF_API_TOKEN" ]]; then echo "  DNS: ${CUR_DNS:-нет} → $MY_IP через Cloudflare"
